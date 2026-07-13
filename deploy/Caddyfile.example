@@ -1,0 +1,19 @@
+{
+  email you@example.com
+}
+
+cycle.example.com {
+  encode zstd gzip
+
+  header {
+    X-Robots-Tag "noindex, nofollow, noarchive"
+    X-Content-Type-Options "nosniff"
+    Referrer-Policy "no-referrer"
+  }
+
+  basic_auth {
+    your-user $2a$14$replace_with_caddy_hash_password_output
+  }
+
+  reverse_proxy 127.0.0.1:3001
+}

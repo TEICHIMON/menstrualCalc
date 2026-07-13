@@ -1,0 +1,209 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: menstruation-calc-deploy
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "22"
+  EXPECTED_DEPLOY_KEY_FINGERPRINT: "SHA256:ODd9UA0Q/doLw45/PHC66K+jtasYGbA2GdSJ2TU8P3A"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      VPS_HOST: ${{ secrets.VPS_HOST }}
+      VPS_USER: ${{ secrets.VPS_USER }}
+      VPS_PORT: ${{ secrets.VPS_PORT || '22' }}
+      APP_PATH: ${{ secrets.APP_PATH || '/opt/menstruation-calc/app' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+          if ! public_key="$(ssh-keygen -y -P "" -f ~/.ssh/deploy_key 2>/dev/null)"; then
+            echo "::error::VPS_SSH_KEY 不是可用的无密码 OpenSSH 私钥。请保存私钥全文，而不是 .pub 公钥。"
+            exit 1
+          fi
+          fingerprint="$(printf '%s\n' "$public_key" | ssh-keygen -lf - | awk '{print $2}')"
+          if [ "$fingerprint" != "$EXPECTED_DEPLOY_KEY_FINGERPRINT" ]; then
+            echo "::error::VPS_SSH_KEY 指纹不匹配：$fingerprint"
+            exit 1
+          fi
+          echo "部署私钥校验通过：$fingerprint"
+
+          rm -f ~/.ssh/known_hosts ~/.ssh/known_hosts.tmp
+          for attempt in 1 2 3 4 5; do
+            if ssh-keyscan -T 10 -t rsa -p "$VPS_PORT" "$VPS_HOST" \
+                 > ~/.ssh/known_hosts.tmp 2>/dev/null \
+               && [ -s ~/.ssh/known_hosts.tmp ]; then
+              mv ~/.ssh/known_hosts.tmp ~/.ssh/known_hosts
+              break
+            fi
+            echo "::warning::第 $attempt 次获取 VPS host key 失败，稍后重试"
+            sleep $((attempt * 3))
+          done
+          if [ ! -s ~/.ssh/known_hosts ]; then
+            echo "::error::无法连接 VPS ($VPS_HOST:$VPS_PORT)——ssh-keyscan 超时或未获取到 host key。请确认服务器在线、SSH 端口正确、防火墙/安全组已放行 GitHub runner。"
+            exit 1
+          fi
+
+          cat > ~/.ssh/config <<EOF
+          Host deploy-vps
+            HostName $VPS_HOST
+            User $VPS_USER
+            Port $VPS_PORT
+            IdentityFile ~/.ssh/deploy_key
+            IdentitiesOnly yes
+            BatchMode yes
+            StrictHostKeyChecking yes
+            UserKnownHostsFile ~/.ssh/known_hosts
+            ConnectTimeout 30
+            ConnectionAttempts 3
+            ServerAliveInterval 30
+            ServerAliveCountMax 6
+            TCPKeepAlive yes
+            ControlMaster auto
+            ControlPersist 15m
+            ControlPath ~/.ssh/control-%C
+          EOF
+          chmod 600 ~/.ssh/config
+
+      - name: Verify SSH connectivity
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if ssh -vv deploy-vps true; then
+              echo "SSH 主连接已建立"
+              exit 0
+            fi
+            echo "::warning::第 $attempt 次 SSH 登录失败，稍后重试"
+            sleep $((attempt * 5))
+          done
+          echo "::error::SSH 登录重试 5 次后仍然失败"
+          exit 1
+
+      - name: Prepare runtime env
+        run: |
+          {
+            printf 'VITE_SUPABASE_URL=%s\n' "$VITE_SUPABASE_URL"
+            printf 'VITE_SUPABASE_ANON_KEY=%s\n' "$VITE_SUPABASE_ANON_KEY"
+          } > .deploy.env
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+
+      - name: Prepare VPS runtime
+        run: |
+          ssh deploy-vps "APP_PATH=\"$APP_PATH\" bash -s" <<'REMOTE'
+          set -euo pipefail
+
+          missing_packages=()
+          if ! command -v rsync >/dev/null 2>&1; then
+            missing_packages+=("rsync")
+          fi
+          if ! command -v docker >/dev/null 2>&1; then
+            missing_packages+=("docker.io")
+          fi
+          if ! docker compose version >/dev/null 2>&1; then
+            missing_packages+=("docker-compose-plugin")
+          fi
+
+          if [ "${#missing_packages[@]}" -gt 0 ]; then
+            apt-get update
+            apt-get install -y "${missing_packages[@]}"
+          fi
+
+          systemctl enable --now docker
+          mkdir -p "$APP_PATH"
+          REMOTE
+
+      - name: Sync project to VPS
+        run: |
+          rsync -az --delete \
+            --exclude '.git' \
+            --exclude 'coverage' \
+            --exclude 'dist' \
+            --exclude 'node_modules' \
+            --exclude '.env' \
+            --exclude '.env.local' \
+            --exclude '.deploy.env' \
+            -e "ssh" \
+            ./ "deploy-vps:$APP_PATH/"
+          scp .deploy.env "deploy-vps:$APP_PATH/.env"
+
+      - name: Check VPS disk space
+        run: |
+          ssh deploy-vps 'bash -s' <<'REMOTE'
+          set -euo pipefail
+
+          cleanup_threshold_kb=$((5 * 1024 * 1024))
+          minimum_free_kb=$((2 * 1024 * 1024))
+          available_kb="$(df -Pk / | awk 'NR == 2 { print $4 }')"
+
+          if [ "$available_kb" -lt "$cleanup_threshold_kb" ]; then
+            echo "根分区可用空间低于 5 GiB，构建前清理安全的 Docker 缓存"
+            docker image prune -f
+            docker builder prune -f --filter "until=168h"
+          fi
+
+          available_kb="$(df -Pk / | awk 'NR == 2 { print $4 }')"
+          df -h /
+          if [ "$available_kb" -lt "$minimum_free_kb" ]; then
+            echo "磁盘可用空间低于 2 GiB，为避免构建耗尽 VPS 磁盘，停止部署" >&2
+            exit 1
+          fi
+          REMOTE
+
+      - name: Build Docker image on VPS
+        run: |
+          ssh deploy-vps "cd \"$APP_PATH\" && DOCKER_BUILDKIT=1 docker compose build"
+
+      - name: Restart app on VPS
+        run: |
+          ssh deploy-vps "cd \"$APP_PATH\" && docker compose up -d --remove-orphans"
+
+      - name: Clean Docker build artifacts
+        run: |
+          ssh deploy-vps 'bash -s' <<'REMOTE'
+          set -euo pipefail
+
+          # 只删除悬空镜像和七天前未使用的构建缓存。
+          # 不清理容器、命名卷或仍被容器引用的镜像。
+          docker image prune -f
+          docker builder prune -f --filter "until=168h"
+          docker system df
+          df -h /
+          REMOTE
